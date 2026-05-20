@@ -2,11 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import re
 
 # ------------------------------------------------------------
 # Configuração da página
 # ------------------------------------------------------------
-st.set_page_config(page_title="Dashboard Educacional - Matemática", layout="wide")
+st.set_page_config(page_title="Dashboard Educacional - MultiMatéria", layout="wide")
 
 COR_PRIMARIA = "#6C63FF"
 COR_ALERTA = "#D32F2F"
@@ -14,14 +15,55 @@ COR_AVISO = "#F57C00"
 COR_SUCESSO = "#2E7D32"
 
 # ------------------------------------------------------------
-# Função para carregar dados de uma turma específica
+# Função para extrair metadados de uma planilha (matéria, turma, professora)
 # ------------------------------------------------------------
-@st.cache_data
-def load_turma(sheet_name, turma_nome):
-    arquivo = "Notas - 1º etapa.xlsx"
+def extrair_metadados(df_raw, sheet_name):
+    """
+    Examina as primeiras linhas da planilha (sem cabeçalho) para encontrar:
+    - Professora
+    - Matéria (ex: MATEMÁTICA, CIÊNCIAS)
+    - Turma (ex: 4º A, 4º B)
+    """
+    texto_inicial = " ".join(df_raw.iloc[:10].astype(str).sum())
+    professora = ""
+    materia = ""
+    turma = ""
     
-    # Tenta encontrar a linha de cabeçalho com "Alunos"
+    # Procura por "Professora:"
+    match_prof = re.search(r'Professora:\s*([^\n]+)', texto_inicial, re.IGNORECASE)
+    if match_prof:
+        professora = match_prof.group(1).strip()
+    else:
+        professora = "Não informada"
+    
+    # Procura por MATEMÁTICA ou CIÊNCIAS (case insensitive)
+    if re.search(r'MATEMÁTICA', texto_inicial, re.IGNORECASE):
+        materia = "MATEMÁTICA"
+    elif re.search(r'CIÊNCIAS', texto_inicial, re.IGNORECASE):
+        materia = "CIÊNCIAS"
+    else:
+        materia = "GERAL"
+    
+    # Procura por padrão de turma: "4º A", "4º B", etc.
+    match_turma = re.search(r'(\d+º\s*[A-Z])', texto_inicial)
+    if match_turma:
+        turma = match_turma.group(1)
+    else:
+        turma = sheet_name  # fallback
+    
+    return professora, materia, turma
+
+# ------------------------------------------------------------
+# Função para carregar dados de UMA planilha (com estrutura flexível)
+# ------------------------------------------------------------
+def carregar_planilha(arquivo, sheet_name):
+    # Lê sem cabeçalho para inspecionar
     df_raw = pd.read_excel(arquivo, sheet_name=sheet_name, header=None)
+    
+    # Extrai metadados
+    professora, materia, turma = extrair_metadados(df_raw, sheet_name)
+    
+    # Encontra a linha que contém "Alunos" (cabeçalho)
     header_row = None
     for i, row in df_raw.iterrows():
         if row.astype(str).str.contains("Alunos", case=False, na=False).any():
@@ -29,115 +71,174 @@ def load_turma(sheet_name, turma_nome):
             break
     
     if header_row is None:
-        st.error(f"Não foi possível encontrar cabeçalho na planilha {sheet_name}")
+        st.warning(f"Planilha {sheet_name}: não encontrou linha com 'Alunos'. Ignorada.")
         return None
     
+    # Lê a partir da linha do cabeçalho
     df = pd.read_excel(arquivo, sheet_name=sheet_name, header=header_row)
+    
+    # Remove linhas totalmente vazias
     df = df.dropna(how='all')
     
-    # Localizar coluna de alunos
+    # Identifica a coluna de alunos
     col_aluno = None
     for col in df.columns:
         if 'aluno' in str(col).lower():
             col_aluno = col
             break
     if col_aluno is None:
-        st.error(f"Coluna de alunos não encontrada em {sheet_name}")
+        st.warning(f"Planilha {sheet_name}: coluna de alunos não encontrada. Ignorada.")
         return None
     
+    # Remove linhas sem nome de aluno
     df = df.dropna(subset=[col_aluno])
     df = df[df[col_aluno].astype(str).str.strip() != ""]
     
-    # Mapeamento de colunas
-    rename_map = {}
+    # Renomeia a coluna de aluno para "Aluno" e armazena o nome original
+    df = df.rename(columns={col_aluno: "Aluno"})
+    
+    # Identifica todas as colunas que são atividades (notas)
+    # Excluímos colunas que não são notas: Nº, Aluno, Resultado Final, Recuperação, Turma, Matéria, etc.
+    colunas_excluir = ["Nº", "Aluno", "Resultado Final", "Recuperação", "Turma", "Matéria"]
+    colunas_atividades = []
     for col in df.columns:
-        col_lower = str(col).lower()
-        if 'aluno' in col_lower:
-            rename_map[col] = "Aluno"
-        elif 'caderno' in col_lower:
-            rename_map[col] = "Caderno"
-        elif 'para casa' in col_lower or 'paracasa' in col_lower:
-            rename_map[col] = "ParaCasa"
-        elif 'livro' in col_lower:
-            rename_map[col] = "Livro"
-        elif 'comportamento' in col_lower:
-            rename_map[col] = "Comportamento"
-        elif 'avaliação' in col_lower or 'avaliacao' in col_lower:
-            rename_map[col] = "Avaliacao"
-        elif 'resultado final' in col_lower or 'resultadofinal' in col_lower:
-            rename_map[col] = "ResultadoFinal"
-        elif 'recuperação' in col_lower or 'recuperacao' in col_lower:
-            rename_map[col] = "Recuperacao"
+        col_upper = str(col).upper()
+        # Se a coluna não está nas excluídas e não é numérica vazia... aceitamos como atividade
+        if col not in colunas_excluir and not col.startswith("Unnamed"):
+            # Testa se a coluna tem valores numéricos (exceto cabeçalho)
+            if df[col].dtype in ['float64', 'int64'] or pd.to_numeric(df[col], errors='coerce').notna().any():
+                colunas_atividades.append(col)
     
-    df = df.rename(columns=rename_map)
+    # Converte colunas de atividades para numérico
+    for col in colunas_atividades:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
-    # Garantir colunas essenciais
-    for col in ["Aluno", "Caderno", "ParaCasa", "Livro", "Comportamento", "Avaliacao", "ResultadoFinal"]:
-        if col not in df.columns:
-            df[col] = 0
+    # Identifica coluna de Resultado Final (pode ter nomes variados)
+    col_resultado = None
+    for col in df.columns:
+        if "resultado final" in str(col).lower() or "resultado" in str(col).lower():
+            col_resultado = col
+            break
+    if col_resultado is None:
+        # Se não existir, criamos somando todas as atividades (pode não ser ideal, mas evita erro)
+        df["ResultadoFinal"] = df[colunas_atividades].sum(axis=1)
+        col_resultado = "ResultadoFinal"
+    else:
+        df = df.rename(columns={col_resultado: "ResultadoFinal"})
     
-    # Converter para numérico
-    for col in ["Caderno", "ParaCasa", "Livro", "Comportamento", "Avaliacao", "ResultadoFinal", "Recuperacao"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    # Coluna de recuperação (opcional)
+    col_rec = None
+    for col in df.columns:
+        if "recuperação" in str(col).lower():
+            col_rec = col
+            break
+    if col_rec:
+        df = df.rename(columns={col_rec: "Recuperacao"})
+        df["Recuperacao"] = pd.to_numeric(df["Recuperacao"], errors='coerce').fillna(0)
+    else:
+        df["Recuperacao"] = 0
     
-    # Adicionar coluna de turma
-    df["Turma"] = turma_nome
+    # Adiciona metadados
+    df["Matéria"] = materia
+    df["Turma"] = turma
+    df["Professora"] = professora
+    
+    # Guarda a lista de atividades originais
+    df.attrs["atividades"] = colunas_atividades
+    
     return df
 
 # ------------------------------------------------------------
-# Carregar ambas as turmas
+# Carregar todas as planilhas do arquivo Excel
+# ------------------------------------------------------------
+@st.cache_data
+def carregar_todos_dados(arquivo="Notas - 1º etapa.xlsx"):
+    xl = pd.ExcelFile(arquivo)
+    todas_planilhas = []
+    for sheet in xl.sheet_names:
+        st.info(f"Carregando planilha: {sheet}")
+        df_sheet = carregar_planilha(arquivo, sheet)
+        if df_sheet is not None:
+            todas_planilhas.append(df_sheet)
+    if not todas_planilhas:
+        st.error("Nenhuma planilha válida encontrada.")
+        return None
+    df_full = pd.concat(todas_planilhas, ignore_index=True)
+    return df_full
+
+# ------------------------------------------------------------
+# Carregar dados
 # ------------------------------------------------------------
 try:
-    df_a = load_turma("Planilha1", "4º A")
-    df_b = load_turma("Planilha2", "4º B")
-    df = pd.concat([df_a, df_b], ignore_index=True)
-    st.success(f"Dados carregados! Total de alunos: {len(df)}")
+    df = carregar_todos_dados()
+    if df is None:
+        st.stop()
+    st.success(f"Dados carregados! Total de registros: {len(df)}")
+    # Exibe as matérias e turmas disponíveis
+    materias_disponiveis = sorted(df["Matéria"].unique())
+    turmas_disponiveis = sorted(df["Turma"].unique())
+    st.sidebar.markdown(f"**📚 Matérias:** {', '.join(materias_disponiveis)}")
+    st.sidebar.markdown(f"**🏫 Turmas:** {', '.join(turmas_disponiveis)}")
 except Exception as e:
-    st.error(f"Erro ao carregar: {e}")
+    st.error(f"Erro ao carregar dados: {e}")
     st.stop()
 
 # ------------------------------------------------------------
 # Filtros laterais
 # ------------------------------------------------------------
-st.sidebar.header("🔍 Filtros")
+st.sidebar.header("🔍 Filtros Dinâmicos")
 
-# Filtro de turma
-turmas = ["Todas", "4º A", "4º B"]
-turma_selecionada = st.sidebar.selectbox("Turma", turmas)
+# Filtro de Matéria (dinâmico)
+materia_selecionada = st.sidebar.selectbox("Matéria", ["Todas"] + materias_disponiveis)
 
-# Aplicar filtro
-if turma_selecionada == "4º A":
-    df_filtro = df[df["Turma"] == "4º A"]
-elif turma_selecionada == "4º B":
-    df_filtro = df[df["Turma"] == "4º B"]
+if materia_selecionada != "Todas":
+    df_filtro_materia = df[df["Matéria"] == materia_selecionada]
 else:
-    df_filtro = df.copy()
+    df_filtro_materia = df
 
-# Filtro de status
+# Filtro de Turma (dinâmico, baseado na matéria selecionada)
+turmas_filtradas = sorted(df_filtro_materia["Turma"].unique())
+turma_selecionada = st.sidebar.selectbox("Turma", ["Todas"] + turmas_filtradas)
+
+if turma_selecionada != "Todas":
+    df_filtro_turma = df_filtro_materia[df_filtro_materia["Turma"] == turma_selecionada]
+else:
+    df_filtro_turma = df_filtro_materia
+
+# Filtro de Status do aluno
 status_opcao = st.sidebar.selectbox(
     "Status do aluno",
     ["Todos", "Acima da média (>=18)", "Em recuperação (<18)"]
 )
 
 if status_opcao == "Acima da média (>=18)":
-    df_filtrado = df_filtro[df_filtro["ResultadoFinal"] >= 18]
+    df_filtrado = df_filtro_turma[df_filtro_turma["ResultadoFinal"] >= 18]
 elif status_opcao == "Em recuperação (<18)":
-    df_filtrado = df_filtro[df_filtro["ResultadoFinal"] < 18]
+    df_filtrado = df_filtro_turma[df_filtro_turma["ResultadoFinal"] < 18]
 else:
-    df_filtrado = df_filtro.copy()
+    df_filtrado = df_filtro_turma
 
 # Botão de exportar CSV
 csv = df_filtrado.to_csv(index=False).encode('utf-8')
 st.sidebar.download_button(
     label="📥 Baixar dados filtrados (CSV)",
     data=csv,
-    file_name=f'dados_{turma_selecionada}_{status_opcao}.csv',
+    file_name=f'dados_{materia_selecionada}_{turma_selecionada}_{status_opcao}.csv',
     mime='text/csv',
 )
 
 # ------------------------------------------------------------
-# KPIs (com arredondamento)
+# Cabeçalho com nome da professora
+# ------------------------------------------------------------
+# Pega o nome da professora (pode variar, mas pegamos o primeiro valor)
+nome_professora = df["Professora"].iloc[0] if not df.empty else "Poliana Camila"
+st.title(f"📊 Dashboard Educacional")
+st.markdown(f"**Professora:** {nome_professora}")
+st.caption(f"Matéria: {materia_selecionada}  |  Turma: {turma_selecionada}  |  Total de alunos: {len(df_filtrado)}")
+st.markdown("---")
+
+# ------------------------------------------------------------
+# KPIs
 # ------------------------------------------------------------
 media_geral = round(df_filtrado["ResultadoFinal"].mean(), 1)
 total_alunos = len(df_filtrado)
@@ -147,12 +248,6 @@ recuperacao = total_alunos - aprovados
 nota_max = df_filtrado["ResultadoFinal"].max()
 nota_min = df_filtrado["ResultadoFinal"].min()
 
-# ------------------------------------------------------------
-# Layout principal com abas
-# ------------------------------------------------------------
-st.title(f"📊 Matemática - 1ª Etapa ({turma_selecionada if turma_selecionada != 'Todas' else '4º A e B'})")
-st.markdown("---")
-
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("🌟 Média da turma", f"{media_geral:.1f} pts")
 col2.metric("✅ Aprovados (≥18)", f"{aprovados} ({taxa_aprovacao:.1f}%)")
@@ -161,16 +256,18 @@ col4.metric("📈 Max / Min", f"{nota_max:.1f} / {nota_min:.1f}")
 
 st.markdown("---")
 
-# Criar abas
+# ------------------------------------------------------------
+# Abas
+# ------------------------------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["📊 Visão Geral", "📈 Comparativo Turmas", "🔥 Mapa de Calor", "👨‍🎓 Detalhamento Individual"])
 
 # ---------- ABA 1: VISÃO GERAL ----------
 with tab1:
-    # Gráfico de barras individual
+    # Gráfico de barras por aluno
     df_plot = df_filtrado.sort_values("ResultadoFinal", ascending=False)
     fig_bar = px.bar(
         df_plot, x="Aluno", y="ResultadoFinal",
-        title="Resultado Final por aluno",
+        title=f"Resultado Final por aluno - {materia_selecionada} {turma_selecionada}",
         text="ResultadoFinal",
         color="ResultadoFinal",
         color_continuous_scale=["#D32F2F", "#F57C00", "#2E7D32"]
@@ -199,176 +296,130 @@ with tab1:
         st.subheader("⚠️ Bottom 5")
         st.dataframe(df_filtrado.nsmallest(5, "ResultadoFinal")[["Aluno", "ResultadoFinal"]].style.format({"ResultadoFinal": "{:.1f}"}))
     
-    # Diagnóstico por atividade (gráfico horizontal)
+    # Diagnóstico por atividade (dinâmico)
     st.subheader("📉 Diagnóstico por Atividade")
     st.caption("Média percentual de aproveitamento por critério (menor = maior dificuldade coletiva)")
     
-    atividades = {
-        "Para Casa": (df_filtrado["ParaCasa"].mean(), 5),
-        "Livro": (df_filtrado["Livro"].mean(), 5),
-        "Avaliação": (df_filtrado["Avaliacao"].mean(), 10),
-        "Caderno": (df_filtrado["Caderno"].mean(), 5),
-        "Comportamento": (df_filtrado["Comportamento"].mean(), 5)
-    }
-    percentuais = []
-    for nome, (media, maximo) in atividades.items():
-        pct = (media / maximo) * 100
-        percentuais.append((nome, media, maximo, pct))
-    percentuais.sort(key=lambda x: x[3])
-    df_diagnostico = pd.DataFrame(percentuais, columns=["Atividade", "Média", "Máximo", "Percentual"])
+    # Obtém as atividades disponíveis para o conjunto filtrado (podem variar conforme matéria)
+    # Extraímos as colunas que são atividades (excluindo as de metadados)
+    colunas_meta = ["Aluno", "ResultadoFinal", "Recuperacao", "Matéria", "Turma", "Professora"]
+    atividades_filtro = [c for c in df_filtrado.columns if c not in colunas_meta and df_filtrado[c].dtype in ['float64', 'int64']]
     
-    fig_horiz = px.bar(
-        df_diagnostico,
-        x="Percentual",
-        y="Atividade",
-        orientation='h',
-        text="Percentual",
-        color="Percentual",
-        color_continuous_scale=["#D32F2F", "#F57C00", "#2E7D32"],
-        labels={"Percentual": "Aproveitamento (%)", "Atividade": ""},
-        title="Aproveitamento por tipo de atividade"
-    )
-    fig_horiz.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-    fig_horiz.update_layout(height=400, showlegend=False)
-    st.plotly_chart(fig_horiz, use_container_width=True)
-    
-    pior_atividade = df_diagnostico.iloc[0]["Atividade"]
-    pior_percentual = df_diagnostico.iloc[0]["Percentual"]
-    pior_media = df_diagnostico.iloc[0]["Média"]
-    pior_max = df_diagnostico.iloc[0]["Máximo"]
-    st.info(f"⚠️ **Crítico:** {pior_atividade} – {pior_media:.1f}/{pior_max} ({pior_percentual:.0f}%)")
-
-# ---------- ABA 2: COMPARATIVO ENTRE TURMAS ----------
-with tab2:
-    st.subheader("📊 Comparativo: 4º A vs 4º B")
-    
-    # Calcular médias por turma e atividade
-    turmas_lista = ["4º A", "4º B"]
-    atividades_lista = ["Caderno", "ParaCasa", "Livro", "Comportamento", "Avaliacao"]
-    maximos_atividades = {"Caderno":5, "ParaCasa":5, "Livro":5, "Comportamento":5, "Avaliacao":10}
-    
-    dados_comp = []
-    for turma in turmas_lista:
-        df_turma = df[df["Turma"] == turma]
-        for ativ in atividades_lista:
-            media = df_turma[ativ].mean()
-            maximo = maximos_atividades[ativ]
-            pct = (media / maximo) * 100
-            dados_comp.append({"Turma": turma, "Atividade": ativ, "Média": media, "Percentual": pct})
-    
-    df_comp = pd.DataFrame(dados_comp)
-    
-    # Gráfico de barras agrupadas (percentual)
-    fig_comp = px.bar(
-        df_comp, x="Atividade", y="Percentual", color="Turma",
-        barmode="group", text="Percentual",
-        labels={"Percentual": "Aproveitamento (%)", "Atividade": ""},
-        title="Comparação de aproveitamento por atividade (percentual)",
-        color_discrete_sequence=[COR_PRIMARIA, COR_SUCESSO]
-    )
-    fig_comp.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
-    fig_comp.update_layout(yaxis=dict(range=[0, 100]), height=500)
-    st.plotly_chart(fig_comp, use_container_width=True)
-    
-    # Card de diferença geral
-    media_a = df[df["Turma"] == "4º A"]["ResultadoFinal"].mean()
-    media_b = df[df["Turma"] == "4º B"]["ResultadoFinal"].mean()
-    diff = media_b - media_a
-    st.metric(
-        label="🏆 Diferença de desempenho (4º B - 4º A)",
-        value=f"{diff:+.1f} pontos",
-        delta=f"{diff/30*100:+.1f}% da nota máxima"
-    )
-    
-    # Explicação
-    if diff > 0:
-        st.success("✅ A turma 4º B teve desempenho superior à 4º A nesta etapa.")
-    elif diff < 0:
-        st.error("⚠️ A turma 4º A teve desempenho superior à 4º B nesta etapa.")
+    if atividades_filtro:
+        # Calcula percentuais
+        dados_atividades = []
+        for ativ in atividades_filtro:
+            media_nota = df_filtrado[ativ].mean()
+            # Tenta adivinhar máximo: se a coluna contém 'avalia' assume 10, senão 5
+            maximo = 10 if 'avalia' in ativ.lower() else 5
+            pct = (media_nota / maximo) * 100
+            dados_atividades.append((ativ, media_nota, maximo, pct))
+        dados_atividades.sort(key=lambda x: x[3])
+        df_diag = pd.DataFrame(dados_atividades, columns=["Atividade", "Média", "Máximo", "Percentual"])
+        
+        fig_horiz = px.bar(
+            df_diag, x="Percentual", y="Atividade", orientation='h',
+            text="Percentual", color="Percentual",
+            color_continuous_scale=["#D32F2F", "#F57C00", "#2E7D32"],
+            labels={"Percentual": "Aproveitamento (%)", "Atividade": ""}
+        )
+        fig_horiz.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+        fig_horiz.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig_horiz, use_container_width=True)
+        
+        pior = df_diag.iloc[0]
+        st.info(f"⚠️ **Crítico:** {pior['Atividade']} – {pior['Média']:.1f}/{pior['Máximo']} ({pior['Percentual']:.0f}%)")
     else:
-        st.info("📊 As duas turmas tiveram desempenho idêntico.")
+        st.warning("Nenhuma atividade identificada para este filtro.")
 
-# ---------- ABA 3: MAPA DE CALOR DAS DIFICULDADES ----------
+# ---------- ABA 2: COMPARATIVO ENTRE TURMAS (para a mesma matéria) ----------
+with tab2:
+    st.subheader(f"📊 Comparativo de turmas - {materia_selecionada}")
+    if materia_selecionada != "Todas":
+        df_comp = df[df["Matéria"] == materia_selecionada]
+        turmas_comp = sorted(df_comp["Turma"].unique())
+        if len(turmas_comp) >= 2:
+            # Calcula médias de resultado final por turma
+            medias_turmas = df_comp.groupby("Turma")["ResultadoFinal"].mean().reset_index()
+            fig_comp_res = px.bar(medias_turmas, x="Turma", y="ResultadoFinal", text="ResultadoFinal",
+                                  title="Média do Resultado Final por Turma",
+                                  labels={"ResultadoFinal": "Média (pts)"},
+                                  color="Turma", color_discrete_sequence=[COR_PRIMARIA, COR_SUCESSO])
+            fig_comp_res.update_traces(texttemplate='%{text:.1f}', textposition='outside')
+            st.plotly_chart(fig_comp_res, use_container_width=True)
+            
+            # Diferença
+            medias_dict = medias_turmas.set_index("Turma")["ResultadoFinal"].to_dict()
+            if "4º B" in medias_dict and "4º A" in medias_dict:
+                diff = medias_dict["4º B"] - medias_dict["4º A"]
+                st.metric("🏆 Diferença (4ºB - 4ºA)", f"{diff:+.1f} pts", delta=f"{diff/30*100:+.1f}%")
+        else:
+            st.info("Apenas uma turma disponível para esta matéria. Selecione 'Todas' no filtro de matéria para comparar.")
+    else:
+        st.info("Selecione uma matéria específica (não 'Todas') para comparar turmas.")
+
+# ---------- ABA 3: MAPA DE CALOR ----------
 with tab3:
     st.subheader("🔥 Mapa de Calor: Aluno vs Atividade")
-    st.caption("Cada célula mostra a nota obtida (normalizada de 0 a 10). Quanto mais vermelho, maior a dificuldade.")
-    
-    # Preparar dados para o heatmap: cada aluno x cada atividade (nota normalizada 0-10)
-    heatmap_data = []
-    alunos = df_filtro["Aluno"].tolist()
-    atividades_heat = ["Caderno", "ParaCasa", "Livro", "Comportamento", "Avaliacao"]
-    maximos_heat = {"Caderno":5, "ParaCasa":5, "Livro":5, "Comportamento":5, "Avaliacao":10}
-    
-    for aluno in alunos:
-        linha = []
-        for ativ in atividades_heat:
-            nota = df_filtro[df_filtro["Aluno"] == aluno][ativ].values[0]
-            maximo = maximos_heat[ativ]
-            nota_normalizada = (nota / maximo) * 10
-            linha.append(round(nota_normalizada, 1))
-        heatmap_data.append(linha)
-    
-    # Criar heatmap com Plotly
-    fig_heat = go.Figure(data=go.Heatmap(
-        z=heatmap_data,
-        x=atividades_heat,
-        y=alunos,
-        colorscale='RdYlGn_r',  # Vermelho = baixo, Verde = alto
-        text=[[f"{val:.1f}" for val in linha] for linha in heatmap_data],
-        texttemplate="%{text}",
-        textfont={"size": 10},
-        colorbar=dict(title="Nota (0-10)")
-    ))
-    fig_heat.update_layout(
-        title="Desempenho por aluno e tipo de atividade (nota normalizada)",
-        xaxis=dict(title="Atividade"),
-        yaxis=dict(title="Aluno", tickfont=dict(size=9)),
-        height=800
-    )
-    st.plotly_chart(fig_heat, use_container_width=True)
-    
-    # Explicação
-    st.info("🔍 **Como interpretar:** Tons avermelhados indicam dificuldade (nota baixa), tons esverdeados indicam domínio. Use para identificar padrões como 'aluno bom em comportamento, mas fraco na avaliação'.")
+    st.caption("Notas normalizadas de 0 a 10 (quanto mais vermelho, maior dificuldade).")
+    if atividades_filtro and len(df_filtrado) > 0:
+        # Prepara matriz
+        alunos_nomes = df_filtrado["Aluno"].tolist()
+        dados_calor = []
+        for aluno in alunos_nomes:
+            linha = []
+            for ativ in atividades_filtro:
+                nota = df_filtrado[df_filtrado["Aluno"] == aluno][ativ].values[0]
+                maximo = 10 if 'avalia' in ativ.lower() else 5
+                nota_norm = (nota / maximo) * 10
+                linha.append(round(nota_norm, 1))
+            dados_calor.append(linha)
+        
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=dados_calor,
+            x=atividades_filtro,
+            y=alunos_nomes,
+            colorscale='RdYlGn_r',
+            text=[[f"{val:.1f}" for val in linha] for linha in dados_calor],
+            texttemplate="%{text}",
+            textfont={"size": 10},
+            colorbar=dict(title="Nota (0-10)")
+        ))
+        fig_heat.update_layout(height=800, xaxis=dict(title="Atividade"), yaxis=dict(title="Aluno", tickfont=dict(size=9)))
+        st.plotly_chart(fig_heat, use_container_width=True)
+    else:
+        st.warning("Sem atividades ou alunos para gerar o mapa de calor.")
 
-# ---------- ABA 4: DETALHAMENTO INDIVIDUAL (RADAR) ----------
+# ---------- ABA 4: RADAR INDIVIDUAL ----------
 with tab4:
     st.subheader("👨‍🎓 Radar de dificuldades por aluno")
-    aluno_selecionado = st.selectbox("Escolha um aluno:", sorted(df_filtro["Aluno"].unique()), key="select_aluno")
-    if aluno_selecionado:
-        aluno = df_filtro[df_filtro["Aluno"] == aluno_selecionado].iloc[0]
-        notas_radar = {
-            "Caderno": aluno["Caderno"] * 2,
-            "Para Casa": aluno["ParaCasa"] * 2,
-            "Livro": aluno["Livro"] * 2,
-            "Comportamento": aluno["Comportamento"] * 2,
-            "Avaliação": aluno["Avaliacao"]
-        }
-        fig_radar = go.Figure()
-        fig_radar.add_trace(go.Scatterpolar(
-            r=list(notas_radar.values()),
-            theta=list(notas_radar.keys()),
-            fill='toself',
-            name=aluno_selecionado,
-            line_color=COR_PRIMARIA
-        ))
-        fig_radar.add_trace(go.Scatterpolar(
-            r=[10,10,10,10,10],
-            theta=list(notas_radar.keys()),
-            fill=None,
-            name="Máximo possível",
-            line=dict(color="gray", dash="dash")
-        ))
-        fig_radar.update_layout(
-            polar=dict(radialaxis=dict(range=[0, 10], tickmode='linear', dtick=2)),
-            showlegend=True,
-            title=f"Perfil de desempenho - {aluno_selecionado}"
-        )
-        st.plotly_chart(fig_radar, use_container_width=True)
-        
-        menor = min(notas_radar, key=notas_radar.get)
-        nota_original = aluno[menor.replace(' ', '') if menor != 'Avaliação' else 'Avaliacao']
-        st.warning(f"⚠️ **Principal dificuldade:** {menor} (nota {nota_original:.1f} de {5 if menor != 'Avaliação' else 10})")
+    if len(df_filtrado) > 0:
+        aluno_selecionado = st.selectbox("Escolha um aluno:", sorted(df_filtrado["Aluno"].unique()), key="select_aluno")
+        if aluno_selecionado:
+            aluno_row = df_filtrado[df_filtrado["Aluno"] == aluno_selecionado].iloc[0]
+            # Notas normalizadas para radar (0-10)
+            radar_data = {}
+            for ativ in atividades_filtro:
+                nota = aluno_row[ativ]
+                maximo = 10 if 'avalia' in ativ.lower() else 5
+                radar_data[ativ] = (nota / maximo) * 10
+            # Categorias e valores
+            categorias = list(radar_data.keys())
+            valores = list(radar_data.values())
+            
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(r=valores, theta=categorias, fill='toself', name=aluno_selecionado, line_color=COR_PRIMARIA))
+            fig_radar.add_trace(go.Scatterpolar(r=[10]*len(categorias), theta=categorias, fill=None, name="Máximo possível", line=dict(color="gray", dash="dash")))
+            fig_radar.update_layout(polar=dict(radialaxis=dict(range=[0,10], dtick=2)), showlegend=True)
+            st.plotly_chart(fig_radar, use_container_width=True)
+            
+            # Identifica pior desempenho
+            pior_ativ = min(radar_data, key=radar_data.get)
+            nota_original = aluno_row[pior_ativ]
+            max_original = 10 if 'avalia' in pior_ativ.lower() else 5
+            st.warning(f"⚠️ **Principal dificuldade:** {pior_ativ} (nota {nota_original:.1f} de {max_original})")
+    else:
+        st.warning("Nenhum aluno para exibir.")
 
-# Rodapé
 st.markdown("---")
-st.caption("Dashboard desenvolvido com Streamlit | Dados da 1ª Etapa | Meta de aprovação: 18 pontos (60%)")
+st.caption("Dashboard universal – lê todas as planilhas e se adapta a diferentes matérias, turmas e atividades.")
